@@ -531,7 +531,7 @@ int main(int argc, char ** argv) {
         const char * ids[] = {"2600", "135", "1184", "996", "145", "2701"};
         for (const char * b : ids) {
             std::ifstream f(o.books + "/" + b + ".txt");
-            if (!f) { fprintf(stderr, "missing book %s/%s.txt\n", o.books.c_str(), b); return 1; }
+            if (!f) { fprintf(stderr, "missing book %s/%s.txt (see --books)\n", o.books.c_str(), b); llama_model_free(model); return 1; }
             std::stringstream ss; ss << f.rdbuf(); std::string t = ss.str();
             size_t a = t.find("*** START OF"); a = a == std::string::npos ? 0 : t.find('\n', a) + 1;
             size_t e = t.find("*** END OF");
@@ -541,7 +541,7 @@ int main(int argc, char ** argv) {
         const double t0 = now_s();
         HAY = tokenize(vocab, hay_txt, false);
         printf("# haystack: %zu tokens from 6 distinct Gutenberg books (%.0fs), non-repeating\n", HAY.size(), now_s() - t0);
-        if ((int) HAY.size() < o.T) { fprintf(stderr, "haystack too short: %zu < %d\n", HAY.size(), o.T); return 1; }
+        if ((int) HAY.size() < o.T) { fprintf(stderr, "haystack too short: %zu < %d\n", HAY.size(), o.T); llama_model_free(model); return 1; }
     }
 
     const int64_t n_layer = llama_model_n_layer(model);

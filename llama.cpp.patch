@@ -1,12 +1,11 @@
 diff --git a/common/CMakeLists.txt b/common/CMakeLists.txt
-index 2b307c59d..f1980acbd 100644
+index 8e3c88dac..1d4bdd20d 100644
 --- a/common/CMakeLists.txt
 +++ b/common/CMakeLists.txt
-@@ -184,3 +184,15 @@ if (LLAMA_LLGUIDANCE)
- endif()
+@@ -187,6 +187,18 @@ endif()
  
  target_link_libraries(${TARGET} PUBLIC llama Threads::Threads)
-+
+ 
 +#
 +# the infinite-context policy module (see common/infinite.h and the README of the unbounded-attention repository).
 +#
@@ -18,11 +17,15 @@ index 2b307c59d..f1980acbd 100644
 +target_include_directories(infinite PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 +target_link_libraries(infinite PUBLIC llama ggml)
 +target_compile_features(infinite PRIVATE cxx_std_17)
++
+ if (CMAKE_SYSTEM_NAME MATCHES "AIX")
+     # AIX's flock() function comes from libbsd.a
+     target_link_libraries(${TARGET} PRIVATE -lbsd)
 diff --git a/include/llama.h b/include/llama.h
-index 3ab935939..5712203d5 100644
+index 3877b69e2..d37f4117c 100644
 --- a/include/llama.h
 +++ b/include/llama.h
-@@ -404,6 +404,8 @@ extern "C" {
+@@ -414,6 +414,8 @@ extern "C" {
                            // NOTE: setting to false when n_seq_max > 1 can cause bad performance in some cases
                            //       ref: https://github.com/ggml-org/llama.cpp/pull/13845#issuecomment-2924800573
          bool kv_unified;  // use a unified buffer across the input sequences when computing the attention
@@ -31,7 +34,7 @@ index 3ab935939..5712203d5 100644
                            // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                            // ref: https://github.com/ggml-org/llama.cpp/pull/14363
  
-@@ -597,6 +599,25 @@ extern "C" {
+@@ -609,6 +611,25 @@ extern "C" {
  
      // Get the model's RoPE frequency scaling factor
      LLAMA_API float llama_model_rope_freq_scale_train(const struct llama_model * model);
@@ -57,7 +60,7 @@ index 3ab935939..5712203d5 100644
  
      // Returns the number of classifier outputs (only valid for classifier models)
      // Undefined behavior for non-classifier models
-@@ -776,6 +797,99 @@ extern "C" {
+@@ -793,6 +814,99 @@ extern "C" {
                   llama_pos p1,
                   llama_pos delta);
  
@@ -158,10 +161,10 @@ index 3ab935939..5712203d5 100644
      // p0 < 0 : [0,  p1]
      // p1 < 0 : [p0, inf)
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 6334f3cca..d7a22658e 100644
+index ea20062a6..088aeba19 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
-@@ -139,6 +139,7 @@ llama_context::llama_context(
+@@ -240,6 +240,7 @@ llama_context::llama_context(
  
      cparams.cb_eval           = params.cb_eval;
      cparams.cb_eval_user_data = params.cb_eval_user_data;
@@ -169,21 +172,24 @@ index 6334f3cca..d7a22658e 100644
  
      cparams.ctx_other = nullptr;
  
-@@ -2354,6 +2355,41 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
+@@ -2771,6 +2772,44 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
      return res;
  }
  
 +// [infinite] read back the per-layer Q/K/V kept as graph outputs by capture_qkv()
 +int64_t llama_context::get_qkv(int32_t il, int32_t which, int32_t tok0, int32_t n_tokens, float * dst) {
 +    // which: 0 = Q, 1 = K (post-rope), 2 = V, 3 = K BEFORE the rope
-+    if (!gf_res_prev || which < 0 || which > 3) {
++    // the result of the last computed graph: upstream keeps one result per output mode and marks
++    // the one it computed last as active
++    llm_graph_result * r = gf_res_prev_active ? gf_res_prev_active : get_gf_res_prev();
++    if (!r || which < 0 || which > 3) {
 +        return -1;
 +    }
 +
-+    const auto & vq = gf_res_prev->t_qcur;
-+    const auto & vk = gf_res_prev->t_kcur;
-+    const auto & vv = gf_res_prev->t_vcur;
-+    const auto & vp = gf_res_prev->t_kpre;
++    const auto & vq = r->t_qcur;
++    const auto & vk = r->t_kcur;
++    const auto & vv = r->t_vcur;
++    const auto & vp = r->t_kpre;
 +
 +    const std::vector<ggml_tensor *> & vec = which == 0 ? vq
 +                                           : (which == 1 ? vk
@@ -211,7 +217,7 @@ index 6334f3cca..d7a22658e 100644
  llm_graph_result * llama_context::get_gf_res_reserve() const {
      return static_cast<llm_graph_result *>(gf_res_reserve.get());
  }
-@@ -3651,6 +3687,7 @@ llama_context_params llama_context_default_params() {
+@@ -4281,6 +4320,7 @@ llama_context_params llama_context_default_params() {
          /*.op_offload                  =*/ true,
          /*.swa_full                    =*/ true,
          /*.kv_unified                  =*/ false,
@@ -219,7 +225,7 @@ index 6334f3cca..d7a22658e 100644
          /*.sampler                     =*/ nullptr,
          /*.n_sampler                   =*/ 0,
          /*.ctx_other                   =*/ nullptr,
-@@ -4075,6 +4112,55 @@ void llama_memory_seq_add(
+@@ -4717,6 +4757,55 @@ void llama_memory_seq_add(
      mem->seq_add(seq_id, p0, p1, delta);
  }
  
@@ -276,10 +282,10 @@ index 6334f3cca..d7a22658e 100644
          llama_memory_t mem,
            llama_seq_id seq_id,
 diff --git a/src/llama-context.h b/src/llama-context.h
-index bf91daa8b..db9edeff9 100644
+index 39c5619df..e8f17eeef 100644
 --- a/src/llama-context.h
 +++ b/src/llama-context.h
-@@ -243,6 +243,8 @@ public:
+@@ -263,6 +263,8 @@ public:
  
      // can reuse the llm_graph_result instance of the context (for example to update a memory module)
      llm_graph_result * get_gf_res_reserve() const;
@@ -289,22 +295,22 @@ index bf91daa8b..db9edeff9 100644
      // returns the result of ggml_backend_sched_graph_compute_async execution
      ggml_status graph_compute(ggml_cgraph * gf, bool batched);
 diff --git a/src/llama-cparams.h b/src/llama-cparams.h
-index b592de18c..22459bb9d 100644
+index 9141cba3e..0d55d8b1a 100644
 --- a/src/llama-cparams.h
 +++ b/src/llama-cparams.h
-@@ -53,6 +53,7 @@ struct llama_cparams {
+@@ -57,6 +57,7 @@ struct llama_cparams {
      bool op_offload;
      bool kv_unified;
      bool pipeline_parallel;
 +    bool kv_capture;         // [infinite] keep Qcur/Kcur/Vcur of every layer as graph outputs
+     bool training;           // set by llama_opt_init()
  
-     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
- 
+     size_t moe_cache_size;
 diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
-index fd4290cf0..fb718720a 100644
+index b99370e2d..cf6595ac3 100644
 --- a/src/llama-graph.cpp
 +++ b/src/llama-graph.cpp
-@@ -1503,6 +1503,58 @@ void llm_graph_context::cb(ggml_tensor * cur, const char * name, int il) const {
+@@ -1600,6 +1600,58 @@ void llm_graph_context::cb(ggml_tensor * cur, const char * name, int il) const {
      }
  }
  
@@ -364,10 +370,10 @@ index fd4290cf0..fb718720a 100644
  
  ggml_tensor * llm_graph_context::build_cvec(
 diff --git a/src/llama-graph.h b/src/llama-graph.h
-index cc4110639..6aa31c0f6 100644
+index 0f8ad8ac9..60141978c 100644
 --- a/src/llama-graph.h
 +++ b/src/llama-graph.h
-@@ -938,6 +938,11 @@ public:
+@@ -973,6 +973,11 @@ public:
      ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
  
      std::vector<ggml_tensor *> t_layer_inp;
@@ -379,7 +385,7 @@ index cc4110639..6aa31c0f6 100644
  
      std::vector<ggml_tensor *> t_sampled;
      std::vector<ggml_tensor *> t_sampled_probs;
-@@ -1040,6 +1045,10 @@ struct llm_graph_context {
+@@ -1090,6 +1095,10 @@ struct llm_graph_context {
      virtual ~llm_graph_context() = default;
  
      void cb(ggml_tensor * cur, const char * name, int il) const;
@@ -388,13 +394,13 @@ index cc4110639..6aa31c0f6 100644
 +    // [infinite] the PRE-RoPE K, so a placed cell can be rotated exactly once
 +    void capture_kpre(ggml_tensor * k, int il) const;
  
-     //
-     // common
+     // true when the last layer must be narrowed to the output rows before the nextn hidden state is captured
+     bool crop_before_nextn(const ggml_tensor * inp_out_ids) const {
 diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
-index a342ee119..406030cb2 100644
+index a1ec67e26..90ebf8a71 100644
 --- a/src/llama-kv-cache.cpp
 +++ b/src/llama-kv-cache.cpp
-@@ -617,6 +617,241 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
+@@ -675,6 +675,241 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
      head = new_head != cells.size() ? new_head : 0;
  }
  
@@ -637,10 +643,10 @@ index a342ee119..406030cb2 100644
      // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
      if (other) {
 diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
-index c4d8699de..622541ada 100644
+index 5aafbebb3..ef566cf3f 100644
 --- a/src/llama-kv-cache.h
 +++ b/src/llama-kv-cache.h
-@@ -141,6 +141,19 @@ public:
+@@ -143,6 +143,19 @@ public:
      void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) override;
      void seq_div (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, int d) override;
  
@@ -661,10 +667,10 @@ index c4d8699de..622541ada 100644
      llama_pos seq_pos_max(llama_seq_id seq_id) const override;
  
 diff --git a/src/llama-memory.h b/src/llama-memory.h
-index db8253966..7e6c8ba1c 100644
+index 37d01ed11..0c3efc085 100644
 --- a/src/llama-memory.h
 +++ b/src/llama-memory.h
-@@ -113,6 +113,40 @@ struct llama_memory_i {
+@@ -145,6 +145,40 @@ struct llama_memory_i {
      virtual void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) = 0;
      virtual void seq_div (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, int d) = 0;
  
@@ -706,10 +712,10 @@ index db8253966..7e6c8ba1c 100644
      virtual llama_pos seq_pos_max(llama_seq_id seq_id) const = 0;
  
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index 3b2536283..de2dfe58d 100644
+index 0b063e845..823573df4 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
-@@ -3059,6 +3059,37 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
+@@ -3843,6 +3843,37 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
      return LLAMA_ROPE_TYPE_NONE;
  }
  
@@ -748,19 +754,17 @@ index 3b2536283..de2dfe58d 100644
      return model->hparams.rope_freq_scale_train;
  }
 diff --git a/src/models/llama.cpp b/src/models/llama.cpp
-index 4bfebc884..8819738e7 100644
+index 26d54968c..6e4a88f77 100644
 --- a/src/models/llama.cpp
 +++ b/src/models/llama.cpp
-@@ -149,6 +149,8 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
-                     ext_factor, attn_factor, beta_fast, beta_slow
-                     );
+@@ -141,12 +141,15 @@ llama_model_llama::graph<embed>::graph(const llm_graph_params & params) : llm_gr
+                     n_embd_head, n_head, n_head_kv, il);
  
+             Qcur = build_rope(Qcur, inp_pos, il);
 +            capture_kpre(Kcur, il);   // [infinite] before the rotation
-+
-             Kcur = ggml_rope_ext(
-                     ctx0, Kcur, inp_pos, rope_factors,
-                     n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
-@@ -159,6 +161,8 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
+             Kcur = build_rope(Kcur, inp_pos, il);
+ 
+             cb(Qcur, "Qcur", il);
              cb(Kcur, "Kcur", il);
              cb(Vcur, "Vcur", il);
  
@@ -770,10 +774,10 @@ index 4bfebc884..8819738e7 100644
                  // Llama4TextL2Norm
                  Qcur = ggml_rms_norm(ctx0, Qcur, hparams.f_norm_rms_eps);
 diff --git a/tools/CMakeLists.txt b/tools/CMakeLists.txt
-index c8ad1db43..b9cd77da7 100644
+index 6a6592c7b..046ced2c0 100644
 --- a/tools/CMakeLists.txt
 +++ b/tools/CMakeLists.txt
-@@ -38,6 +38,7 @@ else()
+@@ -41,6 +41,7 @@ else()
          add_subdirectory(export-lora)
      endif()
      add_subdirectory(fit-params)

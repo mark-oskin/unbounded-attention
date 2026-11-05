@@ -59,7 +59,7 @@ code path.
 
 - A CUDA GPU with room for the model and about 25K cache cells per layer. The measurements were made on one
   H200 (141 GB); a 7 to 8B model at Q8_0 with the full design used under 11 GiB of GPU memory at one million
-  tokens. Metal and CPU builds compile and run but were not measured.
+  tokens. The Metal build compiles and runs the needle test on an Apple-silicon laptop; it was not measured.
 - Host memory for the store: 131 KB per token at f16. 128K tokens need about 17 GiB, one million tokens about
   130 GiB.
 - Models in GGUF. The results used the Q8_0 files of Mistral-7B-v0.3 and Llama-3.1-8B. A Llama-3.1 GGUF must
@@ -78,12 +78,17 @@ LLAMA_CMAKE_ARGS="-DGGML_CUDA=ON" ./apply.sh         # clones llama.cpp at UPSTR
 
 To patch a checkout you already have, pass its path: `./apply.sh /path/to/llama.cpp`. The patch is a plain
 `git apply` against `include/`, `src/`, `common/CMakeLists.txt` and `tools/CMakeLists.txt`; the new files are
-copied in from `files/`. The binary is `llama.cpp/build/bin/llama-inf-bench`.
+copied in from `files/`. The binary is `llama.cpp/build/bin/llama-inf-bench`. The patch is generated against the
+commit in `UPSTREAM_COMMIT`; at another commit, apply it with `git apply --reject` and port any rejected hunk by
+hand, as each is a few lines at a stable anchor (the capture hooks in the model graph, a flag in `llama_cparams`,
+and the library target in `common/CMakeLists.txt`).
 
 ## Use
 
 `--inf` turns the design on. Without it the tool runs the stock engine with dense attention over the whole
-cache, which is the dense reference in every comparison. A bare `--inf` is the configuration of the paper.
+cache, which is the dense reference in every comparison. A bare `--inf` is the configuration of the paper. The
+needle, bench and generation modes load the Gutenberg haystack at start-up, so run `scripts/get_books.sh` once
+and pass `--books DIR` (default `data/books`); prompts mode does not need it.
 
 ### Your own documents
 
@@ -130,7 +135,7 @@ real turn. Compare against stock `llama-bench` from the same build.
 ### Generation
 
 ```sh
-build/bin/llama-inf-bench -m model.gguf --mode gen -p "..." -n 64 --inf
+build/bin/llama-inf-bench -m model.gguf --mode gen -p "..." -n 64 --books data/books --inf
 ```
 
 ### Settings
