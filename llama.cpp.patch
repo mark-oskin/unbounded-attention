@@ -1,0 +1,783 @@
+diff --git a/common/CMakeLists.txt b/common/CMakeLists.txt
+index 2b307c59d..f1980acbd 100644
+--- a/common/CMakeLists.txt
++++ b/common/CMakeLists.txt
+@@ -184,3 +184,15 @@ if (LLAMA_LLGUIDANCE)
+ endif()
+ 
+ target_link_libraries(${TARGET} PUBLIC llama Threads::Threads)
++
++#
++# the infinite-context policy module (see common/infinite.h and the README of the unbounded-attention repository).
++#
++# It is a target of its own rather than part of the common library so that a host linking the
++# policy does not also take on the common library's HTTP and JSON dependencies: the module needs
++# nothing but llama and ggml.
++#
++add_library(infinite STATIC infinite.cpp infinite-freq.cpp)
++target_include_directories(infinite PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
++target_link_libraries(infinite PUBLIC llama ggml)
++target_compile_features(infinite PRIVATE cxx_std_17)
+diff --git a/include/llama.h b/include/llama.h
+index 3ab935939..5712203d5 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -404,6 +404,8 @@ extern "C" {
+                           // NOTE: setting to false when n_seq_max > 1 can cause bad performance in some cases
+                           //       ref: https://github.com/ggml-org/llama.cpp/pull/13845#issuecomment-2924800573
+         bool kv_unified;  // use a unified buffer across the input sequences when computing the attention
++        bool kv_capture; // [infinite] mark Qcur/Kcur/Vcur of every layer as graph outputs so that
++                         // llama_get_qkv() can read them back after llama_decode()
+                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
+                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
+ 
+@@ -597,6 +599,25 @@ extern "C" {
+ 
+     // Get the model's RoPE frequency scaling factor
+     LLAMA_API float llama_model_rope_freq_scale_train(const struct llama_model * model);
++    // [infinite] the EFFECTIVE per-plane RoPE angular frequencies theta_j (j = 0 .. n_rot/2 - 1),
++    // i.e. freq_scale * freq_base^(-2j/n_rot) divided by the model's frequency factors (llama3 /
++    // long-rope).  Needed to de-rotate stored keys and queries into a position-free frame.
++    // Returns the number of planes written, or -(needed) if n_out is too small.
++    LLAMA_API int32_t llama_model_rope_thetas(const struct llama_model * model, float * out, int32_t n_out);
++
++    // [infinite] read back the per-layer Q/K/V of the LAST llama_decode() (needs kv_capture).
++    //   which: 0 = Qcur (post-RoPE), 1 = Kcur (post-RoPE), 2 = Vcur
++    // copies rows [tok0, tok0 + n_tokens) of layer il into dst as float32
++    // (row = n_embd_head*n_head for Q, n_embd_k_gqa for K, n_embd_v_gqa for V).
++    // Returns the number of floats written, or -1 on error.
++    // which: 0 = Q, 1 = K after the rope, 2 = V, 3 = K BEFORE the rope
++    LLAMA_API int64_t llama_get_qkv(
++            struct llama_context * ctx,
++                         int32_t   il,
++                         int32_t   which,
++                         int32_t   tok0,
++                         int32_t   n_tokens,
++                           float * dst);
+ 
+     // Returns the number of classifier outputs (only valid for classifier models)
+     // Undefined behavior for non-classifier models
+@@ -776,6 +797,99 @@ extern "C" {
+                  llama_pos p1,
+                  llama_pos delta);
+ 
++    // [kv-store] Remap the positions of the cells of a sequence, cell by cell.
++    // For every cell of seq_id whose current position p lies in [p0, p1):
++    //     q = map[p - p0]
++    //     q <  0 : the cell is removed from the sequence (its KV slot is freed)
++    //     q >= 0 : the cell's position becomes q; the RoPE re-rotation is queued and applied
++    //              by the next graph update, exactly like llama_memory_seq_add()
++    // Cells outside [p0, p1) are untouched. n_map must be >= (size_t)(p1 - p0).
++    // Unlike llama_memory_seq_add(), the delta may differ per cell, which is what the
++    // "window + forget-list store" placement needs (store rank r is read at distance W + 1 + r).
++    LLAMA_API void llama_memory_seq_remap(
++            llama_memory_t mem,
++              llama_seq_id seq_id,
++                 llama_pos p0,
++                 llama_pos p1,
++           const llama_pos * map,
++                    size_t n_map);
++
++    // [infinite] Direct, CELL-INDEXED manipulation of the KV cache.
++    //
++    // llama_memory_seq_remap() above is keyed by position, which is enough for the paper13
++    // window+store (every live cell has a unique position).  The two-tier far-context design
++    // needs to (a) write keys/values that came back from HOST memory into a *contiguous* range
++    // of cells, so the host->device copy is one call per layer instead of one per cell, and
++    // (b) re-place those cells at their new slot positions every block.  Both are cell-indexed.
++    // The attention kernel is untouched.
++    //
++    // Requires a unified, non-transposed (flash-attention) cache.
++
++    // bytes per cell per layer in the K cache (== the V cache); also reports n_layer / n_embd_k_gqa
++    LLAMA_API size_t llama_memory_kv_row_bytes(
++            llama_memory_t mem,
++                 int32_t * n_layer,
++                 int32_t * n_embd_k_gqa);
++
++    // re-place resident cells: cell[i] moves to dst[i] (the RoPE re-rotation is queued)
++    LLAMA_API void llama_memory_kv_cells_place(
++            llama_memory_t mem,
++              llama_seq_id seq_id,
++          const uint32_t * cell,
++         const llama_pos * dst,
++                    size_t n);
++
++    // write a CONTIGUOUS run of cells [c0, c0+n) from host memory.
++    //   k / v layout: [n_layer][n][row_bytes], row_bytes = llama_memory_kv_row_bytes()
++    //   src[i] = the position the stored key was RoPEd at;  dst[i] = where it must be read.
++    // The cell's position is set to src[i] and then shifted to dst[i], so the pending K-shift
++    // re-rotates it by exactly (dst - src).  Any pending shift on these cells is dropped first,
++    // so call this only when the previous shift has already been applied (i.e. right before a
++    // llama_decode(), which is where the shift graph runs).
++    // cell indices holding positions [p0, p1) of seq_id, in order; UINT32_MAX where absent.
++    // Returns true when every position was found.
++    LLAMA_API bool llama_memory_kv_cells_of(
++            llama_memory_t mem,
++              llama_seq_id seq_id,
++                 llama_pos p0,
++                 llama_pos p1,
++                  uint32_t * cell);
++
++    // Read the K/V rows of the given cells back into host memory, in the cache's own row format.
++    //   k / v layout: [n_layer][n][row_bytes].  Contiguous runs are copied in one call.
++    // This is the ground truth: it is what attention will read, with no dependence on which ggml
++    // node happened to hold Kcur/Vcur.
++    LLAMA_API void llama_memory_kv_cells_read(
++            llama_memory_t mem,
++              llama_seq_id seq_id,
++          const uint32_t * cell,
++                    size_t n,
++                      void * k,
++                      void * v);
++
++    // read back the cache's own state for cells [c0, c0+n): the position each cell carries and
++    // the stream token index it was tagged with by llama_memory_kv_cells_write().  Empty cells
++    // report pos = -1 and tok = LLAMA_TOKEN_NULL.  This is what makes a residency map derivable
++    // from the cache rather than from the caller's bookkeeping.
++    LLAMA_API void llama_memory_kv_cells_state(
++            llama_memory_t mem,
++              llama_seq_id seq_id,
++                  uint32_t c0,
++                    size_t n,
++                 llama_pos * pos,
++               llama_token * tok);
++
++    LLAMA_API void llama_memory_kv_cells_write(
++            llama_memory_t mem,
++              llama_seq_id seq_id,
++                  uint32_t c0,
++                    size_t n,
++         const llama_pos * src,
++         const llama_pos * dst,
++              const void * k,
++              const void * v,
++       const llama_token * tok);
++
+     // Integer division of the positions by factor of `d > 1`
+     // p0 < 0 : [0,  p1]
+     // p1 < 0 : [p0, inf)
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 6334f3cca..d7a22658e 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -139,6 +139,7 @@ llama_context::llama_context(
+ 
+     cparams.cb_eval           = params.cb_eval;
+     cparams.cb_eval_user_data = params.cb_eval_user_data;
++    cparams.kv_capture        = params.kv_capture;   // [infinite]
+ 
+     cparams.ctx_other = nullptr;
+ 
+@@ -2354,6 +2355,41 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
+     return res;
+ }
+ 
++// [infinite] read back the per-layer Q/K/V kept as graph outputs by capture_qkv()
++int64_t llama_context::get_qkv(int32_t il, int32_t which, int32_t tok0, int32_t n_tokens, float * dst) {
++    // which: 0 = Q, 1 = K (post-rope), 2 = V, 3 = K BEFORE the rope
++    if (!gf_res_prev || which < 0 || which > 3) {
++        return -1;
++    }
++
++    const auto & vq = gf_res_prev->t_qcur;
++    const auto & vk = gf_res_prev->t_kcur;
++    const auto & vv = gf_res_prev->t_vcur;
++    const auto & vp = gf_res_prev->t_kpre;
++
++    const std::vector<ggml_tensor *> & vec = which == 0 ? vq
++                                           : (which == 1 ? vk
++                                           : (which == 2 ? vv : vp));
++    if (il < 0 || il >= (int32_t) vec.size() || vec[il] == nullptr) {
++        return -1;
++    }
++
++    ggml_tensor * t = vec[il];
++    if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t)) {
++        return -1;
++    }
++
++    const int64_t n_row = t->ne[0]*t->ne[1];              // elements per token
++    const int64_t n_tok = ggml_nelements(t) / n_row;
++    if (tok0 < 0 || n_tokens <= 0 || tok0 + n_tokens > n_tok) {
++        return -1;
++    }
++
++    ggml_backend_tensor_get(t, dst, tok0*n_row*sizeof(float), n_tokens*n_row*sizeof(float));
++
++    return n_tokens*n_row;
++}
++
+ llm_graph_result * llama_context::get_gf_res_reserve() const {
+     return static_cast<llm_graph_result *>(gf_res_reserve.get());
+ }
+@@ -3651,6 +3687,7 @@ llama_context_params llama_context_default_params() {
+         /*.op_offload                  =*/ true,
+         /*.swa_full                    =*/ true,
+         /*.kv_unified                  =*/ false,
++        /*.kv_capture                  =*/ false,
+         /*.sampler                     =*/ nullptr,
+         /*.n_sampler                   =*/ 0,
+         /*.ctx_other                   =*/ nullptr,
+@@ -4075,6 +4112,55 @@ void llama_memory_seq_add(
+     mem->seq_add(seq_id, p0, p1, delta);
+ }
+ 
++// [infinite] ------------------------------------------------------------------------------
++
++size_t llama_memory_kv_row_bytes(llama_memory_t mem, int32_t * n_layer, int32_t * n_embd_k_gqa) {
++    return ((llama_memory_i *) mem)->kv_row_bytes(n_layer, n_embd_k_gqa);
++}
++
++bool llama_memory_kv_cells_of(llama_memory_t mem, llama_seq_id seq_id, llama_pos p0, llama_pos p1, uint32_t * cell) {
++    return ((llama_memory_i *) mem)->kv_cells_of(seq_id, p0, p1, cell);
++}
++
++void llama_memory_kv_cells_read(llama_memory_t mem, llama_seq_id seq_id, const uint32_t * cell, size_t n, void * k, void * v) {
++    ((llama_memory_i *) mem)->kv_cells_read(seq_id, cell, n, k, v);
++}
++
++void llama_memory_kv_cells_place(llama_memory_t mem, llama_seq_id seq_id, const uint32_t * cell, const llama_pos * dst, size_t n) {
++    ((llama_memory_i *) mem)->kv_cells_place(seq_id, cell, dst, n);
++}
++
++void llama_memory_kv_cells_state(llama_memory_t mem, llama_seq_id seq_id, uint32_t c0, size_t n,
++                                 llama_pos * pos, llama_token * tok) {
++    ((llama_memory_i *) mem)->kv_cells_state(seq_id, c0, n, pos, tok);
++}
++
++void llama_memory_kv_cells_write(llama_memory_t mem, llama_seq_id seq_id, uint32_t c0, size_t n,
++                                 const llama_pos * src, const llama_pos * dst, const void * k, const void * v,
++                                 const llama_token * tok) {
++    ((llama_memory_i *) mem)->kv_cells_write(seq_id, c0, n, src, dst, k, v, tok);
++}
++
++int64_t llama_get_qkv(llama_context * ctx, int32_t il, int32_t which, int32_t tok0, int32_t n_tokens, float * dst) {
++    return ctx->get_qkv(il, which, tok0, n_tokens, dst);
++}
++
++// -----------------------------------------------------------------------------------------
++
++void llama_memory_seq_remap(
++        llama_memory_t mem,
++          llama_seq_id seq_id,
++             llama_pos p0,
++             llama_pos p1,
++       const llama_pos * map,
++                size_t n_map) {
++    if (!mem) {
++        return;
++    }
++
++    mem->seq_remap(seq_id, p0, p1, map, n_map);
++}
++
+ void llama_memory_seq_div(
+         llama_memory_t mem,
+           llama_seq_id seq_id,
+diff --git a/src/llama-context.h b/src/llama-context.h
+index bf91daa8b..db9edeff9 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -243,6 +243,8 @@ public:
+ 
+     // can reuse the llm_graph_result instance of the context (for example to update a memory module)
+     llm_graph_result * get_gf_res_reserve() const;
++    // [infinite] read back the per-layer Q/K/V of the last decode (see llama_get_qkv())
++    int64_t get_qkv(int32_t il, int32_t which, int32_t tok0, int32_t n_tokens, float * dst);
+ 
+     // returns the result of ggml_backend_sched_graph_compute_async execution
+     ggml_status graph_compute(ggml_cgraph * gf, bool batched);
+diff --git a/src/llama-cparams.h b/src/llama-cparams.h
+index b592de18c..22459bb9d 100644
+--- a/src/llama-cparams.h
++++ b/src/llama-cparams.h
+@@ -53,6 +53,7 @@ struct llama_cparams {
+     bool op_offload;
+     bool kv_unified;
+     bool pipeline_parallel;
++    bool kv_capture;         // [infinite] keep Qcur/Kcur/Vcur of every layer as graph outputs
+ 
+     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
+ 
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index fd4290cf0..fb718720a 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1503,6 +1503,58 @@ void llm_graph_context::cb(ggml_tensor * cur, const char * name, int il) const {
+     }
+ }
+ 
++// [infinite] mark this layer's Q/K/V as graph outputs (ggml_gallocr never recycles an output's
++// memory, so the data is still there when llama_decode() returns) and record the tensors.
++void llm_graph_context::capture_qkv(ggml_tensor * q, ggml_tensor * k, ggml_tensor * v, int il) const {
++    if (!cparams.kv_capture || il < 0 || il >= (int) n_layer) {
++        return;
++    }
++
++    if ((int) res->t_qcur.size() != (int) n_layer) {
++        res->t_qcur.assign(n_layer, nullptr);
++        res->t_kcur.assign(n_layer, nullptr);
++        res->t_vcur.assign(n_layer, nullptr);
++    }
++
++    // ggml_set_output() protects a tensor from ggml_gallocr_free_node(), but NOT a tensor that is
++    // a *view*: ggml_gallocr frees the view_src when the view is done with, and the OUTPUT flag on
++    // the view is not consulted.  Vcur is a reshape (a view) of the wv product, so capturing it
++    // directly hands back whatever node was allocated over it later.  ggml_cont() gives each
++    // captured tensor its own allocation; GGML_OP_CONT is not in ggml_op_can_inplace() either.
++    ggml_tensor * tt[3] = { q, k, v };
++    for (int i = 0; i < 3; ++i) {
++        if (!tt[i]) {
++            continue;
++        }
++        ggml_tensor * t = ggml_cont(ctx0, tt[i]);
++        ggml_set_output(t);
++        ggml_build_forward_expand(gf, t);
++        tt[i] = t;
++    }
++
++    res->t_qcur[il] = tt[0];
++    res->t_kcur[il] = tt[1];
++    res->t_vcur[il] = tt[2];
++}
++
++// [infinite] Capture K *before* ggml_rope_ext.  A band cell is read at a slot position that has
++// nothing to do with the position the key was encoded at, so storing the post-RoPE key forces a
++// second rotation (the K-shift) at placement.  Storing the pre-RoPE key lets placement rotate it
++// exactly once, which is also what the compressed store needs: a pre-RoPE key quantises without
++// the position baked into it.
++void llm_graph_context::capture_kpre(ggml_tensor * k, int il) const {
++    if (!cparams.kv_capture || il < 0 || il >= (int) n_layer || !k) {
++        return;
++    }
++    if ((int) res->t_kpre.size() != (int) n_layer) {
++        res->t_kpre.assign(n_layer, nullptr);
++    }
++    ggml_tensor * t = ggml_cont(ctx0, k);
++    ggml_set_output(t);
++    ggml_build_forward_expand(gf, t);
++    res->t_kpre[il] = t;
++}
++
+ 
+ 
+ ggml_tensor * llm_graph_context::build_cvec(
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index cc4110639..6aa31c0f6 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -938,6 +938,11 @@ public:
+     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
+ 
+     std::vector<ggml_tensor *> t_layer_inp;
++    // [infinite] per-layer Qcur / Kcur / Vcur, kept as graph outputs when cparams.kv_capture
++    std::vector<ggml_tensor *> t_qcur;
++    std::vector<ggml_tensor *> t_kcur;
++    std::vector<ggml_tensor *> t_kpre;   // [infinite] K before the rope
++    std::vector<ggml_tensor *> t_vcur;
+ 
+     std::vector<ggml_tensor *> t_sampled;
+     std::vector<ggml_tensor *> t_sampled_probs;
+@@ -1040,6 +1045,10 @@ struct llm_graph_context {
+     virtual ~llm_graph_context() = default;
+ 
+     void cb(ggml_tensor * cur, const char * name, int il) const;
++    // [infinite] keep this layer's Q/K/V alive past the compute so the host can read them
++    void capture_qkv(ggml_tensor * q, ggml_tensor * k, ggml_tensor * v, int il) const;
++    // [infinite] the PRE-RoPE K, so a placed cell can be rotated exactly once
++    void capture_kpre(ggml_tensor * k, int il) const;
+ 
+     //
+     // common
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index a342ee119..406030cb2 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -617,6 +617,241 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
+     head = new_head != cells.size() ? new_head : 0;
+ }
+ 
++void llama_kv_cache::seq_remap(llama_seq_id seq_id, llama_pos p0, llama_pos p1, const llama_pos * map, size_t n_map) {
++    // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
++    if (other) {
++        return;
++    }
++
++    GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
++    GGML_ASSERT(hparams.n_pos_per_embd() == 1 && "seq_remap() is only supported for n_pos_per_embd() == 1");
++    GGML_ASSERT(p0 >= 0 && p1 >= p0);
++    GGML_ASSERT(n_map >= (size_t) (p1 - p0));
++
++    auto & cells = v_cells[seq_to_stream[seq_id]];
++    auto & head  = v_heads[seq_to_stream[seq_id]];
++
++    if (p0 == p1) {
++        return;
++    }
++
++    uint32_t new_head = cells.size();
++
++    for (uint32_t i = 0; i < cells.size(); ++i) {
++        if (!cells.pos_in(i, p0, p1)) {
++            continue;
++        }
++
++        if (!cells.seq_has(i, seq_id)) {
++            continue;
++        }
++
++        const llama_pos p_old = cells.pos_get(i);
++        const llama_pos p_new = map[p_old - p0];
++
++        if (p_new < 0) {
++            // forget this cell
++            if (cells.seq_rm(i, seq_id)) {
++                if (new_head == cells.size()) {
++                    new_head = i;
++                }
++            }
++            continue;
++        }
++
++        if (p_new == p_old) {
++            continue;
++        }
++
++        // queues the RoPE shift for this cell (per-cell delta)
++        if (cells.pos_add(i, p_new - p_old)) {
++            if (new_head == cells.size()) {
++                new_head = i;
++            }
++        }
++    }
++
++    head = new_head != cells.size() ? new_head : 0;
++}
++
++// [infinite] ---------------------------------------------------------------------------------
++//
++// Cell-indexed access, used by the two-tier far-context design (examples/infinite):
++//   * the retrieval band owns a fixed, contiguous range of cells, so a gather from host memory
++//     is ONE ggml_backend_tensor_set per layer instead of one per cell;
++//   * the band is always FULL (S cells), so no cell is ever left empty for find_slot() to take
++//     and the cache's max position stays at the trunk's top, which llama_batch_allocr requires.
++
++size_t llama_kv_cache::kv_row_bytes(int32_t * n_layer_out, int32_t * n_embd_k_gqa_out) const {
++    GGML_ASSERT(!layers.empty());
++
++    const auto & layer = layers[0];
++
++    const uint32_t n_embd_k_gqa = hparams.n_embd_k_gqa(layer.il);
++    const uint32_t n_embd_v_gqa = hparams.n_embd_v_gqa(layer.il);
++
++    const size_t k_row = ggml_row_size(layer.k->type, n_embd_k_gqa);
++    const size_t v_row = ggml_row_size(layer.v->type, n_embd_v_gqa);
++
++    GGML_ASSERT(k_row == v_row && "kv_cells_write() assumes matching K/V row sizes");
++
++    if (n_layer_out)      *n_layer_out      = (int32_t) layers.size();
++    if (n_embd_k_gqa_out) *n_embd_k_gqa_out = (int32_t) n_embd_k_gqa;
++
++    return k_row;
++}
++
++bool llama_kv_cache::kv_cells_of(llama_seq_id seq_id, llama_pos p0, llama_pos p1, uint32_t * cell) const {
++    GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
++
++    const auto & cells = v_cells[seq_to_stream[seq_id]];
++
++    const size_t n = (size_t) (p1 - p0);
++    for (size_t j = 0; j < n; ++j) {
++        cell[j] = UINT32_MAX;
++    }
++
++    size_t found = 0;
++    for (uint32_t i = 0; i < cells.size(); ++i) {
++        if (cells.is_empty(i) || !cells.seq_has(i, seq_id) || !cells.pos_in(i, p0, p1)) {
++            continue;
++        }
++        const size_t j = (size_t) (cells.pos_get(i) - p0);
++        if (cell[j] == UINT32_MAX) {
++            cell[j] = i;
++            found++;
++        }
++    }
++
++    return found == n;
++}
++
++void llama_kv_cache::kv_cells_read(llama_seq_id seq_id, const uint32_t * cell, size_t n, void * k, void * v) const {
++    GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
++    GGML_ASSERT(!v_trans && "kv_cells_read() needs a non-transposed V cache (flash attention)");
++
++    if (n == 0) {
++        return;
++    }
++
++    const uint32_t strm = seq_to_stream[seq_id];
++
++    for (size_t li = 0; li < layers.size(); ++li) {
++        const auto & layer = layers[li];
++
++        const size_t row = ggml_row_size(layer.k->type, hparams.n_embd_k_gqa(layer.il));
++
++        size_t j = 0;
++        while (j < n) {
++            size_t m = 1;
++            while (j + m < n && cell[j + m] == cell[j + m - 1] + 1) {
++                m++;
++            }
++            if (k) {
++                ggml_backend_tensor_get(layer.k_stream[strm], (char *) k + (li*n + j)*row, (size_t) cell[j]*row, m*row);
++            }
++            if (v && layer.v_stream[strm]) {
++                ggml_backend_tensor_get(layer.v_stream[strm], (char *) v + (li*n + j)*row, (size_t) cell[j]*row, m*row);
++            }
++            j += m;
++        }
++    }
++}
++
++void llama_kv_cache::kv_cells_place(llama_seq_id seq_id, const uint32_t * cell, const llama_pos * dst, size_t n) {
++    GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
++
++    auto & cells = v_cells[seq_to_stream[seq_id]];
++
++    for (size_t j = 0; j < n; ++j) {
++        const uint32_t i = cell[j];
++        GGML_ASSERT(i < cells.size());
++        GGML_ASSERT(!cells.is_empty(i));
++
++        const llama_pos d = dst[j] - cells.pos_get(i);
++        if (d != 0) {
++            cells.pos_add(i, d);
++        }
++    }
++}
++
++void llama_kv_cache::kv_cells_state(llama_seq_id seq_id, uint32_t c0, size_t n,
++                                    llama_pos * pos, llama_token * tok) const {
++    GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
++
++    const auto & cells = v_cells[seq_to_stream[seq_id]];
++
++    for (size_t j = 0; j < n; ++j) {
++        const uint32_t i = c0 + (uint32_t) j;
++        GGML_ASSERT(i < cells.size());
++
++        if (cells.is_empty(i) || !cells.seq_has(i, seq_id)) {
++            if (pos) pos[j] = -1;
++            if (tok) tok[j] = LLAMA_TOKEN_NULL;
++            continue;
++        }
++
++        if (pos) pos[j] = cells.pos_get(i);
++        if (tok) tok[j] = cells.ext_get(i).tok;
++    }
++}
++
++void llama_kv_cache::kv_cells_write(llama_seq_id seq_id, uint32_t c0, size_t n,
++                                    const llama_pos * src, const llama_pos * dst,
++                                    const void * k, const void * v,
++                                    const llama_token * tok) {
++    GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
++    GGML_ASSERT(!v_trans && "kv_cells_write() needs a non-transposed V cache (flash attention)");
++
++    if (n == 0) {
++        return;
++    }
++
++    const uint32_t strm = seq_to_stream[seq_id];
++
++    auto & cells = v_cells[strm];
++
++    GGML_ASSERT(c0 + n <= cells.size());
++
++    // free the range, then claim it at the position the stored keys were RoPEd at
++    for (size_t j = 0; j < n; ++j) {
++        const uint32_t i = c0 + (uint32_t) j;
++        if (!cells.is_empty(i)) {
++            cells.rm(i);
++        }
++        cells.pos_set(i, src[j]);
++        cells.seq_add(i, seq_id);
++        if (tok) {
++            llama_kv_cell_ext ext;
++            ext.tok = tok[j];
++            cells.ext_set(i, ext);
++        }
++    }
++
++    // one host->device copy per layer per tensor
++    for (size_t li = 0; li < layers.size(); ++li) {
++        const auto & layer = layers[li];
++
++        const size_t row = ggml_row_size(layer.k->type, hparams.n_embd_k_gqa(layer.il));
++
++        if (k) {
++            ggml_backend_tensor_set(layer.k_stream[strm], (const char *) k + li*n*row, (size_t) c0*row, n*row);
++        }
++        if (v && layer.v_stream[strm]) {
++            ggml_backend_tensor_set(layer.v_stream[strm], (const char *) v + li*n*row, (size_t) c0*row, n*row);
++        }
++    }
++
++    // queue the re-rotation from the stored position to the slot position
++    for (size_t j = 0; j < n; ++j) {
++        if (dst[j] != src[j]) {
++            cells.pos_add(c0 + (uint32_t) j, dst[j] - src[j]);
++        }
++    }
++}
++
++// --------------------------------------------------------------------------------------------
++
+ void llama_kv_cache::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
+     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
+     if (other) {
+diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
+index c4d8699de..622541ada 100644
+--- a/src/llama-kv-cache.h
++++ b/src/llama-kv-cache.h
+@@ -141,6 +141,19 @@ public:
+     void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) override;
+     void seq_div (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, int d) override;
+ 
++    // [kv-store] per-cell position remap; see llama_memory_seq_remap() in llama.h
++    void seq_remap(llama_seq_id seq_id, llama_pos p0, llama_pos p1, const llama_pos * map, size_t n_map) override;
++    // [infinite]
++    size_t kv_row_bytes(int32_t * n_layer, int32_t * n_embd_k_gqa) const override;
++    bool   kv_cells_of   (llama_seq_id seq_id, llama_pos p0, llama_pos p1, uint32_t * cell) const override;
++    void   kv_cells_read (llama_seq_id seq_id, const uint32_t * cell, size_t n, void * k, void * v) const override;
++    void   kv_cells_place(llama_seq_id seq_id, const uint32_t * cell, const llama_pos * dst, size_t n) override;
++    void   kv_cells_state(llama_seq_id seq_id, uint32_t c0, size_t n,
++                          llama_pos * pos, llama_token * tok) const override;
++    void   kv_cells_write(llama_seq_id seq_id, uint32_t c0, size_t n,
++                          const llama_pos * src, const llama_pos * dst,
++                          const void * k, const void * v,
++                          const llama_token * tok) override;
+     llama_pos seq_pos_min(llama_seq_id seq_id) const override;
+     llama_pos seq_pos_max(llama_seq_id seq_id) const override;
+ 
+diff --git a/src/llama-memory.h b/src/llama-memory.h
+index db8253966..7e6c8ba1c 100644
+--- a/src/llama-memory.h
++++ b/src/llama-memory.h
+@@ -113,6 +113,40 @@ struct llama_memory_i {
+     virtual void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) = 0;
+     virtual void seq_div (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, int d) = 0;
+ 
++    // [kv-store] per-cell position remap; see llama_memory_seq_remap() in llama.h.
++    // default: unsupported
++    virtual void seq_remap(llama_seq_id /*seq_id*/, llama_pos /*p0*/, llama_pos /*p1*/, const llama_pos * /*map*/, size_t /*n_map*/) {
++        GGML_ABORT("seq_remap() is not supported by this memory type");
++    }
++
++
++    // [infinite] cell-indexed KV manipulation; see llama.h.  default: unsupported
++    virtual size_t kv_row_bytes(int32_t * /*n_layer*/, int32_t * /*n_embd_k_gqa*/) const {
++        GGML_ABORT("kv_row_bytes() is not supported by this memory type");
++    }
++    virtual bool kv_cells_of(llama_seq_id /*seq_id*/, llama_pos /*p0*/, llama_pos /*p1*/, uint32_t * /*cell*/) const {
++        GGML_ABORT("kv_cells_of() is not supported by this memory type");
++    }
++    virtual void kv_cells_read(llama_seq_id /*seq_id*/, const uint32_t * /*cell*/, size_t /*n*/, void * /*k*/, void * /*v*/) const {
++        GGML_ABORT("kv_cells_read() is not supported by this memory type");
++    }
++    virtual void kv_cells_place(llama_seq_id /*seq_id*/, const uint32_t * /*cell*/, const llama_pos * /*dst*/, size_t /*n*/) {
++        GGML_ABORT("kv_cells_place() is not supported by this memory type");
++    }
++    virtual void kv_cells_state(llama_seq_id /*seq_id*/, uint32_t /*c0*/, size_t /*n*/,
++                                llama_pos * /*pos*/, llama_token * /*tok*/) const {
++        GGML_ABORT("kv_cells_state() is not supported by this memory type");
++    }
++    virtual void kv_cells_write(llama_seq_id /*seq_id*/, uint32_t /*c0*/, size_t /*n*/,
++                                const llama_pos * /*src*/, const llama_pos * /*dst*/,
++                                const void * /*k*/, const void * /*v*/,
++                                const llama_token * /*tok*/) {
++        GGML_ABORT("kv_cells_write() is not supported by this memory type");
++    }    virtual void kv_cells_write(llama_seq_id /*seq_id*/, uint32_t /*c0*/, size_t /*n*/,
++                                const llama_pos * /*src*/, const llama_pos * /*dst*/,
++                                const void * /*k*/, const void * /*v*/) {
++        GGML_ABORT("kv_cells_write() is not supported by this memory type");
++    }
+     virtual llama_pos seq_pos_min(llama_seq_id seq_id) const = 0;
+     virtual llama_pos seq_pos_max(llama_seq_id seq_id) const = 0;
+ 
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 3b2536283..de2dfe58d 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -3059,6 +3059,37 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
+     return LLAMA_ROPE_TYPE_NONE;
+ }
+ 
++// [infinite] effective per-plane RoPE angular frequencies, including freq_scale and the
++// model's frequency factors (llama3 / long-rope).  See llama_model_rope_thetas() in llama.h.
++int32_t llama_model_rope_thetas(const llama_model * model, float * out, int32_t n_out) {
++    const uint32_t n_rot = model->hparams.n_rot();
++    const int32_t n_planes = (int32_t) n_rot / 2;
++
++    if (n_out < n_planes) {
++        return -n_planes;
++    }
++
++    const float base  = model->hparams.rope_freq_base_train;
++    const float scale = model->hparams.rope_freq_scale_train;
++
++    std::vector<float> ff;
++    if (!model->layers.empty() && model->layers[0].rope_freqs != nullptr) {
++        ggml_tensor * rf = model->layers[0].rope_freqs;
++        ff.resize(ggml_nelements(rf));
++        ggml_backend_tensor_get(rf, ff.data(), 0, ggml_nbytes(rf));
++    }
++
++    for (int32_t j = 0; j < n_planes; ++j) {
++        float theta = scale * powf(base, -2.0f*j/(float) n_rot);
++        if (j < (int32_t) ff.size() && ff[j] != 0.0f) {
++            theta /= ff[j];
++        }
++        out[j] = theta;
++    }
++
++    return n_planes;
++}
++
+ float llama_model_rope_freq_scale_train(const llama_model * model) {
+     return model->hparams.rope_freq_scale_train;
+ }
+diff --git a/src/models/llama.cpp b/src/models/llama.cpp
+index 4bfebc884..8819738e7 100644
+--- a/src/models/llama.cpp
++++ b/src/models/llama.cpp
+@@ -149,6 +149,8 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
+                     ext_factor, attn_factor, beta_fast, beta_slow
+                     );
+ 
++            capture_kpre(Kcur, il);   // [infinite] before the rotation
++
+             Kcur = ggml_rope_ext(
+                     ctx0, Kcur, inp_pos, rope_factors,
+                     n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
+@@ -159,6 +161,8 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
+             cb(Kcur, "Kcur", il);
+             cb(Vcur, "Vcur", il);
+ 
++            capture_qkv(Qcur, Kcur, Vcur, il);   // [infinite]
++
+             if (hparams.use_kq_norm) {
+                 // Llama4TextL2Norm
+                 Qcur = ggml_rms_norm(ctx0, Qcur, hparams.f_norm_rms_eps);
+diff --git a/tools/CMakeLists.txt b/tools/CMakeLists.txt
+index c8ad1db43..b9cd77da7 100644
+--- a/tools/CMakeLists.txt
++++ b/tools/CMakeLists.txt
+@@ -38,6 +38,7 @@ else()
+         add_subdirectory(export-lora)
+     endif()
+     add_subdirectory(fit-params)
++    add_subdirectory(inf-bench)
+     if (GGML_METAL)
+         add_subdirectory(tuning)
+     endif()

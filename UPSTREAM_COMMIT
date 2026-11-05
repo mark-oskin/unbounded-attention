@@ -1,0 +1,3 @@
+186eab1cb83899282bec44b837270959b56ee8f3
+# first line: the ggml-org/llama.cpp commit the patch was last applied, built and tested against (2026-11-05)
+# the patch was developed against d1d3c3396aa13a5f239109a822666c4870490ad5 (2026-09-15) and applies cleanly to both

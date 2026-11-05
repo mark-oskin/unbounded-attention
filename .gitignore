@@ -1,0 +1,4 @@
+llama.cpp/
+data/
+build/
+*.gguf
