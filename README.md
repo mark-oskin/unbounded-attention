@@ -4,7 +4,8 @@ A patch to [llama.cpp](https://github.com/ggml-org/llama.cpp) that retrofits unb
 rotary decoder. The model is not fine-tuned and no weight changes. Tested on Mistral-7B-v0.3 and Llama-3.1-8B
 from 32K tokens to one million tokens on one GPU.
 
-A paper describing the design and its measurements is forthcoming; the citation will be added here.
+The design and its measurements are described in the paper: Mark Oskin, *Retrofitting Unbounded Context onto
+Stock Language Models*, arXiv:2611.10141, 2026. <https://arxiv.org/abs/2611.10141>
 
 ## What it does
 
@@ -164,6 +165,18 @@ configuration.
 
 - Mistral-7B-v0.3, Q8_0, trained range 32,768 tokens
 - Llama-3.1-8B, Q8_0 converted from the official weights, trained range 131,072 tokens
+
+## Citation
+
+```bibtex
+@article{oskin2026unbounded,
+  author  = {Mark Oskin},
+  title   = {Retrofitting Unbounded Context onto Stock Language Models},
+  journal = {arXiv preprint arXiv:2611.10141},
+  year    = {2026},
+  url     = {https://arxiv.org/abs/2611.10141}
+}
+```
 
 ## License
 
